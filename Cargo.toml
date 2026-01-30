@@ -1,0 +1,15 @@
+[[bin]]
+name = "NET_TRACER"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+
+[package]
+name = "net_tracer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+winping = "0.10"
+notify-rust = "4.11.7"
