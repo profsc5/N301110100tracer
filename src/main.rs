@@ -1,11 +1,23 @@
 #![windows_subsystem = "windows"]
 
+use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use notify_rust::{Notification, Timeout};
 use winping::{Buffer, Pinger};
+
+const SAMPLE_PERIOD: Duration = Duration::from_millis(250);
+const LOSS_WINDOW: Duration = Duration::from_secs(30);
+
+const ERROR_COOLDOWN: Duration = Duration::from_secs(30);
+const LOSS_COOLDOWN: Duration = Duration::from_secs(30);
+const LATENCY_COOLDOWN: Duration = Duration::from_secs(30);
+
+const HIGH_LATENCY_MS: u32 = 100;
+const LOSS_THRESHOLD_PCT: u32 = 10;
+const MIN_SAMPLES_FOR_LOSS: usize = 10;
 
 fn init_ip() -> IpAddr {
     std::env::args()
@@ -15,46 +27,82 @@ fn init_ip() -> IpAddr {
         .expect("Could not parse IP Address")
 }
 
-fn ping_ip(pinger: &Pinger, dst: IpAddr, buffer: &mut Buffer) -> Result<u32, String> {
-    pinger.send(dst, buffer).map_err(|e| e.to_string())
-}
-
-fn show_notification(msg: &str) -> Result<(), Box<dyn std::error::Error>> {
-    Notification::new()
+fn show_notification(msg: &str) {
+    let _ = Notification::new()
         .summary("NET TRACER")
         .body(msg)
         .timeout(Timeout::Milliseconds(5000))
-        .show()?;
-    Ok(())
+        .show();
+}
+
+#[derive(Clone, Copy)]
+struct Sample {
+    t: Instant,
+    lost: bool,
 }
 
 fn main() {
-    show_notification("NET TRACER running").ok();
+    show_notification("NET TRACER running");
 
     let dst = init_ip();
     let pinger = Pinger::new().expect("Failed to create pinger");
     let mut buffer = Buffer::new();
 
-    let mut last_notify = Instant::now() - Duration::from_secs(60);
+    let mut samples: VecDeque<Sample> = VecDeque::new();
+    let mut lost_in_window: u32 = 0;
+
+    let mut next_error_notify_at = Instant::now();
+    let mut next_loss_notify_at = Instant::now();
+    let mut next_latency_notify_at = Instant::now();
 
     loop {
-        match ping_ip(&pinger, dst, &mut buffer) {
-            Ok(ms) => {
-                if ms > 100 && last_notify.elapsed() > Duration::from_secs(30) {
-                    let body = format!("High latency: {} ms", ms);
-                    show_notification(&body).ok();
-                    last_notify = Instant::now();
-                }
+        let now = Instant::now();
+
+        let ping_result = pinger.send(dst, &mut buffer);
+        let lost = ping_result.is_err();
+
+        samples.push_back(Sample { t: now, lost });
+        if lost {
+            lost_in_window += 1;
+        }
+
+        while let Some(front) = samples.front() {
+            if now.duration_since(front.t) <= LOSS_WINDOW {
+                break;
             }
-            Err(e) => {
-                if last_notify.elapsed() > Duration::from_secs(30) {
-                    let body = format!("Ping error: {}", e);
-                    show_notification(&body).ok();
-                    last_notify = Instant::now();
-                }
+            let old = samples.pop_front().unwrap();
+            if old.lost {
+                lost_in_window = lost_in_window.saturating_sub(1);
             }
         }
 
-        sleep(Duration::from_millis(250));
+        if let Ok(ms) = ping_result {
+            if ms > HIGH_LATENCY_MS && now >= next_latency_notify_at {
+                show_notification(&format!("High latency: {ms} ms"));
+                next_latency_notify_at = now + LATENCY_COOLDOWN;
+            }
+        } else if now >= next_error_notify_at {
+            show_notification(&format!("Ping error: {}", ping_result.unwrap_err()));
+            next_error_notify_at = now + ERROR_COOLDOWN;
+        }
+
+        let n = samples.len();
+        if n >= MIN_SAMPLES_FOR_LOSS {
+            let n_u32 = n as u32;
+            let loss_pct = lost_in_window.saturating_mul(100) / n_u32;
+
+            if loss_pct > LOSS_THRESHOLD_PCT && now >= next_loss_notify_at {
+                show_notification(&format!(
+                    "Packet loss last {}s: {}% ({} / {})",
+                    LOSS_WINDOW.as_secs(),
+                    loss_pct,
+                    lost_in_window,
+                    n_u32
+                ));
+                next_loss_notify_at = now + LOSS_COOLDOWN;
+            }
+        }
+
+        sleep(SAMPLE_PERIOD);
     }
 }
